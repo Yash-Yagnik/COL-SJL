@@ -21,21 +21,23 @@ class ConsoleNotifier:
     def __init__(self) -> None:
         self._report_generator = IncidentReportGenerator()
 
-    def notify_if_intrusion(self, high_level_events: List[Dict]) -> None:
+    def notify_if_intrusion(self, events: List[Dict]) -> None:
         """
-        Inspect high-level events and, if a possible intrusion is
+        Inspect per-frame events and, if an intrusion is
         present, print an alert to the console.
         """
         # Generate a structured report from the events.
         structured_report = self._report_generator.generate_structured_report(
-            high_level_events
+            events
         )
         if not structured_report:
             return
 
-        # Treat any report whose incident_type contains "Intrusion"
-        # as an intrusion for this MVP.
-        if "Intrusion" not in structured_report["incident_type"]:
+        # Only alert for the strongest intrusion-like headlines.
+        if structured_report["incident_type"] not in (
+            "Possible Intrusion Detected",
+            "Entry Attempt Detected",
+        ):
             return
 
         text = self._report_generator.format_text_report(structured_report)

@@ -66,12 +66,35 @@ class IncidentReportGenerator:
         Pick the most important event for the report. For an MVP we
         prioritise:
 
-        1. possible_intrusion
-        2. vehicle_arrival
+        1. high_risk_intrusion (new behavioral engine)
+        2. attempted_entry
+        3. approaching_entry
+        4. possible_intrusion (legacy)
+        5. vehicle_arrival
         3. any other event
         """
         if not events:
             return None
+
+        # New engine emits an intrusion summary event with "event" field.
+        for ev in events:
+            if ev.get("event") == "high_risk_intrusion":
+                # Normalize to an IncidentEvent-like dict.
+                return {
+                    "event_type": "high_risk_intrusion",
+                    "suspect_count": len(ev.get("actors", [])) or int(ev.get("suspect_count", 0) or 0),
+                    "vehicles_detected": ev.get("vehicles_detected", []),
+                    "timestamp": ev.get("timestamp", ""),
+                    "raw": ev,
+                }
+
+        for ev in events:
+            if ev.get("event_type") == "attempted_entry":
+                return ev
+
+        for ev in events:
+            if ev.get("event_type") == "approaching_entry":
+                return ev
 
         # Look for a "possible_intrusion" event first.
         for ev in events:
@@ -104,8 +127,14 @@ class IncidentReportGenerator:
             else "None / Unknown"
         )
 
-        incident_type = "Possible Intrusion Detected"
-        if incident_event.event_type != "possible_intrusion":
+        # Headline mapping for common behavioral events.
+        if incident_event.event_type in ("high_risk_intrusion", "possible_intrusion"):
+            incident_type = "Possible Intrusion Detected"
+        elif incident_event.event_type == "attempted_entry":
+            incident_type = "Entry Attempt Detected"
+        elif incident_event.event_type == "approaching_entry":
+            incident_type = "Approaching Entry Detected"
+        else:
             incident_type = incident_event.event_type.replace("_", " ").title()
 
         return {

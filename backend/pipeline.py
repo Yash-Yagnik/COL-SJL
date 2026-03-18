@@ -21,7 +21,9 @@ from typing import Any, Dict, List
 from backend.video.ingestion import VideoIngestion
 from backend.detection.yolo_detector import YoloV8Detector
 from backend.tracking.deepsort_tracker import DeepSortTracker
-from backend.analysis.event_engine import EventAnalysisEngine
+from backend.analysis.event_engine import EventEngine
+from backend.analysis.zones import default_zones
+from backend.notifications.console_notifier import ConsoleNotifier
 
 
 def run_pipeline(video_path: str) -> Dict[str, Any]:
@@ -39,17 +41,20 @@ def run_pipeline(video_path: str) -> Dict[str, Any]:
     dict
         High-level analysis, including estimated suspect count.
     """
-    ingestion = VideoIngestion(video_path=video_path, sample_interval=.5)
+    ingestion = VideoIngestion(video_path=video_path, sample_interval=0.5)
     detector = YoloV8Detector()
     tracker = DeepSortTracker()
-    analysis_engine = EventAnalysisEngine()
+    event_engine = EventEngine(zones=default_zones())
+    notifier = ConsoleNotifier()
 
     tracking_events: List[Dict[str, Any]] = []
+    per_frame_behavior: List[Dict[str, Any]] = []
 
     # 1) Ingest sampled frames from the video.
     for frame_data in ingestion.iter_frames():
         frame = frame_data.image
         timestamp = frame_data.timestamp
+        frame_idx = frame_data.frame_index
 
         # 2) Run YOLOv8 detection on the current frame.
         detection_event = detector.detect_frame(frame=frame, timestamp=timestamp)
@@ -59,9 +64,26 @@ def run_pipeline(video_path: str) -> Dict[str, Any]:
 
         tracking_events.append(tracking_event)
 
-    # 4) Pass all tracking events to the event analysis engine.
-    analysis_result = analysis_engine.analyze_events(tracking_events)
-    return analysis_result
+        # 4) Behavioral event detection (temporal).
+        behavior_out = event_engine.update(
+            frame=frame,
+            frame_idx=frame_idx,
+            timestamp_sec=float(timestamp),
+            tracked_objects=tracking_event.get("objects", []),
+        )
+        per_frame_behavior.append(behavior_out)
+
+        # 5) Console notifications when an intrusion event is emitted.
+        notifier.notify_if_intrusion(behavior_out.get("events", []))
+
+    final_behavior = event_engine.finalize()
+
+    return {
+        "tracking_events": tracking_events,
+        "behavior_frames": per_frame_behavior,
+        "behavior_summary": final_behavior.get("event_summary", {}),
+        "behavior_events": final_behavior.get("events", []),
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
