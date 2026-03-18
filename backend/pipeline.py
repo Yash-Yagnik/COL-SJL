@@ -18,15 +18,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-from backend.video.ingestion import VideoIngestion
-from backend.detection.yolo_detector import YoloV8Detector
-from backend.tracking.deepsort_tracker import DeepSortTracker
-from backend.analysis.event_engine import EventEngine
-from backend.analysis.zones import default_zones
 from backend.notifications.console_notifier import ConsoleNotifier
+from backend.ml_intrusion.inference import predict_sequence, DEFAULT_THRESHOLD
+from backend.ml_intrusion.data_loader import list_split_sequences
 
 
-def run_pipeline(video_path: str) -> Dict[str, Any]:
+def run_pipeline(video_path: str, *, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
     """
     Runs the end-to-end CV pipeline on a single video and returns
     a high-level analysis dictionary.
@@ -41,48 +38,42 @@ def run_pipeline(video_path: str) -> Dict[str, Any]:
     dict
         High-level analysis, including estimated suspect count.
     """
-    ingestion = VideoIngestion(video_path=video_path, sample_interval=0.5)
-    detector = YoloV8Detector()
-    tracker = DeepSortTracker()
-    event_engine = EventEngine(zones=default_zones())
     notifier = ConsoleNotifier()
 
-    tracking_events: List[Dict[str, Any]] = []
-    per_frame_behavior: List[Dict[str, Any]] = []
+    # Model-driven inference only (no rule-based intrusion logic).
+    # For frame datasets, video_path should be a directory containing the frames for one sequence.
+    if Path(video_path).is_dir():
+        import os
 
-    # 1) Ingest sampled frames from the video.
-    for frame_data in ingestion.iter_frames():
-        frame = frame_data.image
-        timestamp = frame_data.timestamp
-        frame_idx = frame_data.frame_index
+        frame_paths = [
+            os.path.join(video_path, f)
+            for f in sorted(os.listdir(video_path))
+            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+        ]
+        probability = predict_sequence(Path(video_path).name, frame_paths, threshold=threshold)
+    else:
+        # If a user passes a raw string id, attempt to locate it in the test split.
+        seq_id = Path(video_path).stem
+        sequences = list_split_sequences("test")
+        match = next((s for s in sequences if s.sequence_id.lower() == seq_id.lower()), None)
+        if match is None:
+            raise FileNotFoundError(
+                "Provide either a directory of frames for one sequence, "
+                "or a sequence id that exists in the test split."
+            )
+        probability = predict_sequence(match.sequence_id, match.frame_paths, threshold=threshold)
 
-        # 2) Run YOLOv8 detection on the current frame.
-        detection_event = detector.detect_frame(frame=frame, timestamp=timestamp)
-
-        # 3) Update DeepSORT tracker with detections and get tracking event.
-        tracking_event = tracker.update(frame=frame, detection_event=detection_event)
-
-        tracking_events.append(tracking_event)
-
-        # 4) Behavioral event detection (temporal).
-        behavior_out = event_engine.update(
-            frame=frame,
-            frame_idx=frame_idx,
-            timestamp_sec=float(timestamp),
-            tracked_objects=tracking_event.get("objects", []),
-        )
-        per_frame_behavior.append(behavior_out)
-
-        # 5) Console notifications when an intrusion event is emitted.
-        notifier.notify_if_intrusion(behavior_out.get("events", []))
-
-    final_behavior = event_engine.finalize()
+    notifier.notify_intrusion_probability(
+        video_path=video_path,
+        probability=probability,
+        threshold=threshold,
+    )
 
     return {
-        "tracking_events": tracking_events,
-        "behavior_frames": per_frame_behavior,
-        "behavior_summary": final_behavior.get("event_summary", {}),
-        "behavior_events": final_behavior.get("events", []),
+        "video": video_path,
+        "intrusion_probability": probability,
+        "threshold": threshold,
+        "is_intrusion": bool(probability > threshold),
     }
 
 
@@ -94,7 +85,7 @@ def main(argv: list[str] | None = None) -> None:
         argv = sys.argv[1:]
 
     if not argv:
-        print("Usage: python -m backend.pipeline <video_path>")
+        print("Usage: python -m backend.pipeline <video_path> [threshold]")
         raise SystemExit(1)
 
     video_path = argv[0]
@@ -102,7 +93,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Video file not found: {video_path}")
         raise SystemExit(1)
 
-    result = run_pipeline(video_path)
+    thr = float(argv[1]) if len(argv) >= 2 else DEFAULT_THRESHOLD
+    result = run_pipeline(video_path, threshold=thr)
     print(json.dumps(result, indent=2))
 
 
