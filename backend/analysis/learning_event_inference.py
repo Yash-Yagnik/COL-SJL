@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import math
 import torch
 import torch.nn as nn
 
+from backend.analysis.contextual_features import append_zone_features
+
 
 @dataclass
 class _TrackState:
-    history: Deque[Tuple[float, float, float]]  # (timestamp, cx, cy)
+    history: Deque[Tuple[float, float, float]]
     last_bbox: Tuple[float, float, float, float]
     first_seen: float
     last_seen: float
@@ -24,10 +26,10 @@ def _bbox_center(bbox: List[float]) -> Tuple[float, float]:
 
 class TrajectoryFeatureExtractor:
     """
-    Streaming trajectory/spatial/temporal feature extractor.
+    Streaming trajectory / spatial / temporal feature extractor.
 
-    Features are computed only from tracker outputs and frame geometry,
-    so this remains memory-efficient for long videos.
+    Produces 12 base features; pipeline combines with 3 zone-occupancy
+    features for a 15-dim contextual vector (see contextual_features).
     """
 
     def __init__(self, history_size: int = 64) -> None:
@@ -37,9 +39,7 @@ class TrajectoryFeatureExtractor:
         self.unique_people_ids: set[int] = set()
         self.unique_vehicle_ids: set[int] = set()
         self.disappearance_points: List[Tuple[float, float]] = []
-        self._prev_people: set[int] = set()
-        self._prev_vehicles: set[int] = set()
-        self._prev_timestamp: float | None = None
+        self._prev_timestamp: Optional[float] = None
 
     def _update_states(
         self,
@@ -131,8 +131,6 @@ class TrajectoryFeatureExtractor:
 
         dt = 0.0 if self._prev_timestamp is None else max(timestamp - self._prev_timestamp, 1e-6)
         self._prev_timestamp = timestamp
-        self._prev_people = curr_people_ids
-        self._prev_vehicles = curr_vehicle_ids
 
         h, w = frame_shape[:2]
         diag = max((w * w + h * h) ** 0.5, 1e-6)
@@ -161,7 +159,7 @@ class TrajectoryFeatureExtractor:
         mean_person_vehicle_dist = sum(prox_vals) / len(prox_vals) if prox_vals else 1.0
 
         time_scale = dt if dt > 0 else 1.0
-        feature_vec = [
+        return [
             float(len(curr_people_ids)),
             float(len(curr_vehicle_ids)),
             float(len(self.unique_people_ids)),
@@ -175,11 +173,10 @@ class TrajectoryFeatureExtractor:
             float(mean_person_vehicle_dist),
             float(math.log1p(len(self.disappearance_points))),
         ]
-        return feature_vec
 
 
 class TrajectoryEventClassifier(nn.Module):
-    def __init__(self, input_dim: int = 12, hidden_dim: int = 64, num_layers: int = 1) -> None:
+    def __init__(self, input_dim: int = 15, hidden_dim: int = 64, num_layers: int = 1) -> None:
         super().__init__()
         self.gru = nn.GRU(
             input_size=input_dim,
@@ -195,41 +192,79 @@ class TrajectoryEventClassifier(nn.Module):
         return self.classifier(last)
 
 
+def _fallback_probability(feature_sequence: List[List[float]]) -> float:
+    """Data-relative score: min-max normalize over the clip, then sigmoid of mean(last)."""
+    if not feature_sequence:
+        return 0.0
+    import numpy as np
+
+    arr = np.array(feature_sequence, dtype=np.float64)
+    mins = arr.min(axis=0)
+    maxs = arr.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-6)
+    last = (arr[-1] - mins) / span
+    z = float(np.clip(last.mean(), 0.0, 1.0))
+    return float(1.0 / (1.0 + math.exp(-(z * 4.0 - 2.0))))
+
+
 class LearningBasedEventInference:
     """
-    Model-only event inference from tracked object trajectories.
+    Learned sequence model over contextual trajectory features.
+    Falls back to data-normalized scoring if weights are missing.
     """
 
     def __init__(
         self,
         *,
         model_path: str = "intrusion_event_model.pt",
-        device: torch.device | None = None,
+        device: Optional[torch.device] = None,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.extractor = TrajectoryFeatureExtractor()
         self._feature_sequence: List[List[float]] = []
+        self.model: Optional[TrajectoryEventClassifier] = None
+        self.input_dim = 15
+        self.decision_threshold = 0.5
+        self._used_learned_weights = False
 
-        payload = torch.load(model_path, map_location=self.device)
+        payload = None
+        try:
+            try:
+                payload = torch.load(model_path, map_location=self.device, weights_only=False)
+            except TypeError:
+                payload = torch.load(model_path, map_location=self.device)
+        except FileNotFoundError:
+            payload = None
+        except Exception:
+            payload = None
+
         if isinstance(payload, dict) and "state_dict" in payload:
             state_dict = payload["state_dict"]
             meta = payload.get("meta", {})
-        else:
+        elif payload is not None:
             state_dict = payload
             meta = {}
+        else:
+            state_dict = None
+            meta = {}
 
-        input_dim = int(meta.get("input_dim", 12))
-        hidden_dim = int(meta.get("hidden_dim", 64))
-        num_layers = int(meta.get("num_layers", 1))
-        self.decision_threshold = float(meta.get("decision_threshold", 0.5))
-
-        self.model = TrajectoryEventClassifier(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-        ).to(self.device)
-        self.model.load_state_dict(state_dict)
-        self.model.eval()
+        if state_dict is not None:
+            self.input_dim = int(meta.get("input_dim", 15))
+            hidden_dim = int(meta.get("hidden_dim", 64))
+            num_layers = int(meta.get("num_layers", 1))
+            self.decision_threshold = float(meta.get("decision_threshold", 0.5))
+            self.model = TrajectoryEventClassifier(
+                input_dim=self.input_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+            ).to(self.device)
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+                self.model.eval()
+                self._used_learned_weights = True
+            except Exception:
+                self.model = None
+                self._used_learned_weights = False
 
     def update(
         self,
@@ -237,31 +272,44 @@ class LearningBasedEventInference:
         frame_shape: Tuple[int, int, int],
         timestamp: float,
         tracked_objects: List[Dict[str, Any]],
+        zone_counts: Optional[Dict[str, int]] = None,
+        total_tracks: int = 0,
     ) -> None:
-        feat = self.extractor.update(
+        base = self.extractor.update(
             frame_shape=frame_shape,
             timestamp=timestamp,
             tracked_objects=tracked_objects,
         )
-        self._feature_sequence.append(feat)
+        zc = zone_counts or {"vehicle_zone": 0, "transition_zone": 0, "entry_zone": 0}
+        if self.input_dim <= len(base):
+            feat = base[: self.input_dim]
+        else:
+            feat = append_zone_features(base, zc, total_tracks)
+            while len(feat) < self.input_dim:
+                feat.append(0.0)
+            feat = feat[: self.input_dim]
+        self._feature_sequence.append(feat[: self.input_dim])
 
     def finalize(self) -> Dict[str, Any]:
         if not self._feature_sequence:
             prob = 0.0
-        else:
+        elif self.model is not None:
             x = torch.tensor(self._feature_sequence, dtype=torch.float32, device=self.device).unsqueeze(0)
+            if x.shape[2] != self.input_dim:
+                x = x[:, :, : self.input_dim]
             with torch.no_grad():
                 logit = self.model(x).squeeze()
                 prob = float(torch.sigmoid(logit).item())
+        else:
+            prob = _fallback_probability(self._feature_sequence)
 
         return {
             "intrusion_probability": prob,
-            "is_intrusion": bool(prob >= self.decision_threshold),
-            "threshold": self.decision_threshold,
             "sequence_length": len(self._feature_sequence),
+            "used_learned_model": self._used_learned_weights,
+            "decision_threshold": self.decision_threshold,
             "activity": {
                 "people_detections": len(self.extractor.unique_people_ids),
                 "vehicle_detections": len(self.extractor.unique_vehicle_ids),
             },
         }
-
