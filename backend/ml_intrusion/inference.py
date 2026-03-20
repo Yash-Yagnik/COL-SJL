@@ -86,7 +86,7 @@ def predict_sequence(
     *,
     model_path: str = "intrusion_model.pt",
     threshold: float = DEFAULT_THRESHOLD,
-    max_frames: int = 20,
+    max_frames: Optional[int] = None,
     backbone_name: str = "resnet18",
     print_alert: bool = True,
     verbose: bool = True,
@@ -125,7 +125,6 @@ def predict_video(
     model_path: str = "intrusion_model.pt",
     threshold: float = DEFAULT_THRESHOLD,
     sample_interval: float = 0.5,
-    max_frames: int = 20,
     backbone_name: str = "resnet18",
     print_alert: bool = True,
     verbose: bool = True,
@@ -137,15 +136,13 @@ def predict_video(
     Sampling:
     - uses OpenCV
     - samples frames every `sample_interval` seconds
-    - limits to `max_frames`
+    - processes frames until the video ends
     """
     # For compatibility with your existing frame sampling logic, we reuse VideoIngestion.
     ingestion = VideoIngestion(video_path=video_path, sample_interval=sample_interval)
     frames: List = []
-    for i, frame_data in enumerate(ingestion.iter_frames()):
+    for frame_data in ingestion.iter_frames():
         frames.append(frame_data.image)
-        if len(frames) >= max_frames:
-            break
 
     print(f"Processing video: {video_path}")
     return predict_frames(

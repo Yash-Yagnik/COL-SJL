@@ -90,6 +90,7 @@ class DeepSortTracker:
             Fallback IoU tracker threshold when DeepSORT is unavailable.
         """
         self._seen_person_ids: set[int] = set()
+        self._seen_vehicle_ids: set[int] = set()
         self._iou_match_threshold = iou_match_threshold
 
         if _HAS_DEEPSORT:
@@ -103,7 +104,48 @@ class DeepSortTracker:
             # Fallback: simple IoU matcher (keeps IDs stable for smooth motion).
             self.tracker = None
             self._next_id = 1
-            self._tracks: List[_IoUTrack] = []
+            self._tracks_by_type: Dict[str, List[_IoUTrack]] = {"person": [], "vehicle": []}
+
+    def _update_iou_tracks(
+        self,
+        *,
+        detections: List[Tuple[Tuple[float, float, float, float], float, str]],
+        object_type: str,
+        tracked_objects: List[Dict[str, Any]],
+    ) -> None:
+        tracks = self._tracks_by_type.setdefault(object_type, [])
+
+        for tr in tracks:
+            tr.missed += 1
+
+        for bbox, conf, obj_type in detections:
+            best_track = None
+            best_iou = 0.0
+            for tr in tracks:
+                iou_val = _iou(tr.bbox_xyxy, bbox)
+                if iou_val > best_iou:
+                    best_iou = iou_val
+                    best_track = tr
+
+            if best_track is not None and best_iou >= self._iou_match_threshold:
+                best_track.bbox_xyxy = bbox
+                best_track.missed = 0
+                track_id = best_track.track_id
+            else:
+                track_id = self._next_id
+                self._next_id += 1
+                tracks.append(_IoUTrack(track_id=track_id, bbox_xyxy=bbox))
+
+            if obj_type == "person":
+                self._seen_person_ids.add(track_id)
+            elif obj_type == "vehicle":
+                self._seen_vehicle_ids.add(track_id)
+
+            tracked_objects.append(
+                {"id": track_id, "type": obj_type, "confidence": conf, "bbox": list(bbox)}
+            )
+
+        self._tracks_by_type[object_type] = [tr for tr in tracks if tr.missed <= 50]
 
     def update(
         self,
@@ -179,6 +221,8 @@ class DeepSortTracker:
 
                 if obj_type == "person":
                     self._seen_person_ids.add(track_id)
+                elif obj_type == "vehicle":
+                    self._seen_vehicle_ids.add(track_id)
 
                 tracked_objects.append(
                     {
@@ -204,47 +248,22 @@ class DeepSortTracker:
                 else:
                     vehicle_dets.append((bbox, conf, obj_type))
 
-            # Only track people in fallback mode (vehicles are just passed through).
-            # 1) Mark tracks missed by default.
-            for tr in self._tracks:
-                tr.missed += 1
-
-            # 2) Match detections to existing tracks.
-            for bbox, conf, obj_type in person_dets:
-                best_track = None
-                best_iou = 0.0
-                for tr in self._tracks:
-                    iou_val = _iou(tr.bbox_xyxy, bbox)
-                    if iou_val > best_iou:
-                        best_iou = iou_val
-                        best_track = tr
-
-                if best_track is not None and best_iou >= self._iou_match_threshold:
-                    best_track.bbox_xyxy = bbox
-                    best_track.missed = 0
-                    track_id = best_track.track_id
-                else:
-                    track_id = self._next_id
-                    self._next_id += 1
-                    self._tracks.append(_IoUTrack(track_id=track_id, bbox_xyxy=bbox))
-
-                self._seen_person_ids.add(track_id)
-                tracked_objects.append(
-                    {"id": track_id, "type": obj_type, "confidence": conf, "bbox": list(bbox)}
-                )
-
-            # 3) Drop old tracks after a grace period.
-            self._tracks = [tr for tr in self._tracks if tr.missed <= 50]
-
-            # Add vehicles without IDs (or could assign separate IDs if desired).
-            for bbox, conf, obj_type in vehicle_dets:
-                tracked_objects.append(
-                    {"id": None, "type": obj_type, "confidence": conf, "bbox": list(bbox)}
-                )
+            self._update_iou_tracks(
+                detections=person_dets,
+                object_type="person",
+                tracked_objects=tracked_objects,
+            )
+            self._update_iou_tracks(
+                detections=vehicle_dets,
+                object_type="vehicle",
+                tracked_objects=tracked_objects,
+            )
 
         return {
             "timestamp": timestamp,
             "objects": tracked_objects,
+            "total_unique_people": len(self._seen_person_ids),
+            "total_unique_vehicles": len(self._seen_vehicle_ids),
             "total_suspects": len(self._seen_person_ids),
         }
 

@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Tuple, Optional
 
 import cv2
 
@@ -115,22 +115,24 @@ def list_split_sequences(split: str) -> List[SequenceItem]:
 def iter_sampled_frames_from_images(
     frame_paths: List[str],
     *,
-    max_frames: int = 20,
+    max_frames: Optional[int] = None,
 ) -> Iterator:
     """
     Stream frames from a list of image paths without loading everything into memory.
 
-    - Uniformly subsamples to at most `max_frames`
+    - Uniformly subsamples to at most `max_frames` if provided.
     """
     if not frame_paths:
         return
 
-    # Choose a stride so we never exceed max_frames.
-    stride = max(len(frame_paths) // max_frames, 1)
+    if max_frames is None:
+        stride = 1
+    else:
+        stride = max(len(frame_paths) // max_frames, 1)
 
     kept = 0
     for i in range(0, len(frame_paths), stride):
-        if kept >= max_frames:
+        if max_frames is not None and kept >= max_frames:
             break
         frame = cv2.imread(frame_paths[i])
         if frame is None:
@@ -142,7 +144,7 @@ def iter_sampled_frames_from_images(
 def load_sequence_frames(
     frame_paths: List[str],
     *,
-    max_frames: int = 20,
+    max_frames: Optional[int] = None,
 ) -> List:
     """
     Convenience wrapper returning a bounded list of sampled frames from image paths.
