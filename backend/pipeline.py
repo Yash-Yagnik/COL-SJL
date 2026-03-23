@@ -34,18 +34,18 @@ def _compact_tracks(repo: TrackRepository) -> Dict[str, Any]:
             "exit_timestamp_sec": rec.exit_timestamp_sec,
             "entry_frame_index": rec.entry_frame_index,
             "exit_frame_index": rec.exit_frame_index,
-            "trajectory": [
-                {
-                    "t": p["t"],
-                    "frame_index": p["frame_index"],
-                    "cx": p["cx"],
-                    "cy": p["cy"],
-                    "zone": p.get("zone"),
-                    "velocity_px_s": p.get("velocity_px_s"),
-                    "velocity_vector_px_s": p.get("velocity_vector_px_s"),
-                }
-                for p in rec.trajectory
-            ],
+            # "trajectory": [
+            #     {
+            #         "t": p["t"],
+            #         "frame_index": p["frame_index"],
+            #         "cx": p["cx"],
+            #         "cy": p["cy"],
+            #         "zone": p.get("zone"),
+            #         "velocity_px_s": p.get("velocity_px_s"),
+            #         "velocity_vector_px_s": p.get("velocity_vector_px_s"),
+            #     }
+            #     for p in rec.trajectory
+            # ],
         }
     for vid, rec in repo.all_vehicles().items():
         out["vehicles"][vid] = {
